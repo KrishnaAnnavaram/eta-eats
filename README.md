@@ -65,6 +65,7 @@ This README is the **one location that explains all of eta-eats**. It gives thes
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one training run](#42-the-life-cycle-of-one-training-run)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [Data cleanup and row-wise features](#5-data-cleanup-and-row-wise-features)
 6. 🟢 [Splits, pipeline and models](#6-splits-pipeline-and-models)
 7. 🟣 [Evaluation, model card and prediction](#7-evaluation-model-card-and-prediction)
@@ -126,6 +127,36 @@ flowchart LR
 | Synthetic data | `src/eta_eats/synthetic.py` | Raw-format files with the Kaggle quirks |
 | CLI | `src/eta_eats/cli.py` | The `eta-eats` command |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    CLI["cli.py<br/>eta-eats command"]
+    SYN["synthetic.py<br/>write_synthetic"]
+    subgraph DATAG["Data"]
+        DAT["data.py<br/>load, prepare, split"]
+        CLN["clean.py<br/>clean, DOMAINS, CleanReport"]
+        FEA["features.py<br/>add_features, make_preprocessor, model_input"]
+    end
+    subgraph MODELG["Model"]
+        TRN["train.py<br/>fit_and_score, compare, save, predict_file"]
+        MOD["models.py<br/>make_pipeline, tune"]
+        EVA["evaluate.py<br/>metrics, bootstrap_mae, slice_metrics, importance"]
+    end
+
+    CLI --> SYN
+    CLI --> DAT
+    CLI --> TRN
+    DAT --> CLN
+    DAT --> FEA
+    FEA --> CLN
+    TRN --> DAT
+    TRN --> FEA
+    TRN --> MOD
+    TRN --> EVA
+    MOD --> FEA
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -172,6 +203,19 @@ eta-eats/
 ### 3.4 No leakage
 Row-wise features use one row only. The imputer, the scaler and the one-hot encoder are inside the pipeline, so they are fitted on the training rows only.
 
+```mermaid
+flowchart LR
+    ROWS[/"Clean rows with row-wise features"/] --> SPL["data.split"]
+    SPL --> TR["Training rows"]
+    SPL --> TE["Test rows"]
+    TR --> CV["tune: GroupKFold folds<br/>inside the training rows"]
+    TR --> FIT["Pipeline.fit<br/>imputers, scaler, one-hot encoder, regressor"]
+    CV --> FIT
+    FIT --> PRED["Pipeline.predict<br/>no fit on test rows"]
+    TE --> PRED
+    PRED --> REP[/"Metrics, slices, importance"/]
+```
+
 ### 3.5 The tuned model is the final model
 `models.tune` uses `RandomizedSearchCV` with `refit=True` and courier-grouped folds. `train.fit_and_score` scores and saves `best_estimator_`. A test compares the saved parameters with the best parameters.
 
@@ -194,26 +238,64 @@ The package has a CLI, local relative paths, environment variables and no notebo
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    RAW["raw train.csv"] --> CL["clean: spaces, NaN strings, category maps, target, coordinates"]
-    CL --> RO["join date + time, roll over midnight"]
-    RO --> FE["row-wise features: distance, prep_min, hour, weekday, traffic_x_distance"]
-    FE --> SP{"split"}
-    SP -->|"time"| T1["train: earlier dates / test: later dates"]
-    SP -->|"courier"| T2["train and test couriers are different"]
-    T1 --> PIPE["pipeline: preprocessor + regressor, fit on train"]
-    T2 --> PIPE
-    PIPE --> TUNE["optional: randomized search, GroupKFold by courier"]
-    TUNE --> SCORE["test metrics + bootstrap MAE interval"]
-    PIPE --> SCORE
-    SCORE --> SL["slices: city, traffic, weather, distance band, festival"]
-    SCORE --> IMP["permutation importance"]
-    SL --> SAVE["model.joblib + metadata.json + model_card.md"]
+flowchart TD
+    RAW[/"Raw train.csv<br/>Kaggle or synthetic"/] --> LOAD["data.load<br/>read all values as text"]
+    LOAD --> CL["clean: spaces, NaN strings, category maps,<br/>target, coordinates, roll-over"]
+    CL --> OK{"Contract holds?"}
+    OK -- "no" --> DQE[/"DataQualityError"/]
+    OK -- "yes" --> FE["add_features: distance_km, prep_min,<br/>order_hour, weekday, traffic_x_distance"]
+    FE --> SP{"--split"}
+    SP -- "time, default" --> T1["Test rows: latest 20 % of dates"]
+    SP -- "courier" --> T2["Test rows: other couriers"]
+    SP -- "random" --> T3["Test rows: random 20 %"]
+    T1 --> TU{"--tune?"}
+    T2 --> TU
+    T3 --> TU
+    TU -- "no" --> FIT["make_pipeline.fit<br/>on the training rows"]
+    TU -- "yes, gbm only" --> RS["tune: RandomizedSearchCV,<br/>GroupKFold by courier, refit"]
+    FIT --> SC["Score the test rows: metrics,<br/>bootstrap MAE interval"]
+    RS --> SC
+    SC --> SL["slice_metrics: city, traffic,<br/>weather, distance band, festival"]
+    SC --> IMP["importance: permutation"]
+    SL --> SAVE[("models/<br/>model.joblib, metadata.json, slices.csv,<br/>importance.csv, model_card.md")]
     IMP --> SAVE
-    SAVE --> PRED["predict test.csv"] --> SUB["submission.csv"]
+    SAVE --> CHK{{"HUMAN<br/>read the slice table and the model card<br/>before use in a new city"}}
+    TEST[/"Raw test.csv, no target"/] --> PRED["predict_file<br/>feature check, clean, predict"]
+    SAVE --> PRED
+    PRED --> SUB[/"reports/submission.csv"/]
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class CHK human
 ```
 
 ### 4.2 The life cycle of one training run
+
+```mermaid
+stateDiagram-v2
+    state "Raw text frame" as Raw
+    state "Clean frame" as Clean
+    state "Frame with row-wise features" as Featured
+    state "Train and test parts" as Parts
+    state "Fitted pipeline" as Fitted
+    state "Tuned pipeline, best_estimator_" as Tuned
+    state "Scored" as Scored
+    state "Saved in models/" as Saved
+    [*] --> Raw: load, all values as str
+    Raw --> DataQualityError: missing column, unknown category, bad date or target
+    Raw --> Clean: clean
+    Clean --> Featured: add_features
+    Featured --> ValueError: empty part
+    Featured --> Parts: split
+    Parts --> ValueError: --tune with a model that is not gbm
+    Parts --> Fitted: make_pipeline.fit
+    Parts --> Tuned: tune, refit=True
+    Fitted --> Scored: metrics, bootstrap_mae, slices, importance
+    Tuned --> Scored: metrics, bootstrap_mae, slices, importance
+    Scored --> Saved: save, model_card
+    Saved --> [*]
+    DataQualityError --> [*]
+    ValueError --> [*]
+```
 
 1. Read the raw file as text.
 2. Clean the columns and check every category.
@@ -224,11 +306,86 @@ flowchart TB
 7. Calculate the slice metrics and the permutation importance.
 8. Save the pipeline, the metadata, the slices, the importance and the model card.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor A as Analyst
+    participant CLI as eta-eats CLI
+    participant DAT as data.py
+    participant TRN as train.py
+    participant MOD as models.py
+    participant EVA as evaluate.py
+    participant FS as models/ and reports/
+
+    A->>CLI: eta-eats train --model gbm --split time --tune
+    CLI->>DAT: load(path), then clean and add_features
+    DAT-->>CLI: frame and CleanReport
+    CLI->>DAT: split(frame, time, seed)
+    DAT-->>CLI: SplitResult
+    CLI->>TRN: fit_and_score(gbm, parts, do_tune)
+    TRN->>MOD: tune(X_train, y_train, courier groups)
+    MOD-->>TRN: best_estimator_, best_params, cv_mae
+    TRN->>EVA: metrics, bootstrap_mae, slice_metrics, importance
+    EVA-->>TRN: test metrics, interval, slices, importance
+    TRN-->>CLI: TrainOutcome
+    CLI->>TRN: save(outcome)
+    TRN->>FS: model.joblib, metadata.json, slices.csv, importance.csv, model_card.md
+    A->>CLI: eta-eats predict --input data/test.csv
+    CLI->>TRN: predict_file(model_dir, input, out)
+    TRN->>FS: load_model, check the feature list
+    TRN->>DAT: load(input, require_target=False)
+    TRN->>FS: write submission.csv with ID and the prediction
+    CLI-->>A: number of predictions written
+```
+
 ---
 
 ## 5. Data cleanup and row-wise features
 
 **Purpose.** Change the raw file into typed columns and correct features.
+
+The cleaner, `clean.clean`:
+
+```mermaid
+flowchart TD
+    IN[/"Raw frame, all values as text"/] --> COL{"19 input columns present?<br/>Time_taken(min) for a training file"}
+    COL -- "no" --> ERR[/"DataQualityError"/]
+    COL -- "yes" --> STR["_strip: remove spaces,<br/>NaN, nan and empty to missing"]
+    STR --> NUM["Numbers: age, rating, coordinates,<br/>vehicle condition, multiple deliveries"]
+    STR --> CC["courier_city: letters<br/>before RES in the courier ID"]
+    STR --> DATE{"Order_Date readable<br/>as dd-mm-yyyy?"}
+    DATE -- "no" --> ERR
+    DATE -- "yes" --> TIME["Join the date with the order time<br/>and the pick-up time"]
+    STR --> CAT{"Each category in DOMAINS?<br/>weather without the conditions prefix"}
+    CAT -- "no" --> ERR
+    CAT -- "yes" --> TRF["traffic_level map<br/>Low 0, Medium 1, High 2, Jam 3"]
+    STR --> TGT["parse_target<br/>regex on (min) 24"]
+    TGT --> TOK{"Training file:<br/>target readable?"}
+    TOK -- "no" --> ERR
+    TOK -- "yes" --> OUT[/"Clean frame and CleanReport"/]
+    NUM --> OUT
+    CC --> OUT
+    TIME --> OUT
+    TRF --> OUT
+```
+
+The row-wise features, `features.add_features`:
+
+```mermaid
+flowchart LR
+    C[/"Clean frame"/] --> D["haversine_km<br/>restaurant to drop point"]
+    C --> P["prep_min = pick-up time - order time<br/>outside 0 to 120 set to missing"]
+    C --> H["order_hour from the order time,<br/>else from the pick-up time"]
+    C --> W["weekday from Order_Date"]
+    D --> X["traffic_x_distance =<br/>traffic_level × distance_km"]
+    D --> OUT[/"Frame with row-wise features,<br/>count of impossible prep times"/]
+    P --> OUT
+    H --> OUT
+    W --> OUT
+    X --> OUT
+```
 
 | Input | Output |
 |---|---|
@@ -266,6 +423,54 @@ flowchart TB
 
 **Purpose.** Fit a model that generalizes to later dates and to new couriers.
 
+The splits, `data.split`:
+
+```mermaid
+flowchart TD
+    IN[/"Clean frame, kind,<br/>test_size 0.2, seed"/] --> K{"kind"}
+    K -- "time" --> T["Sort the distinct order dates,<br/>cut at 80 %"]
+    T --> TT["Train: dates before the cut<br/>Test: dates from the cut"]
+    K -- "courier" --> G["GroupShuffleSplit<br/>groups = courier_id"]
+    G --> GT["No courier in both parts"]
+    K -- "random" --> R["train_test_split<br/>seeded rows"]
+    K -- "other" --> ERR[/"ValueError"/]
+    TT --> E{"Empty part?"}
+    GT --> E
+    R --> E
+    E -- "yes" --> ERR
+    E -- "no" --> OUT[/"SplitResult: train, test,<br/>kind, description"/]
+```
+
+The model pipeline, `models.make_pipeline`:
+
+```mermaid
+flowchart LR
+    X[/"model_input<br/>17 feature columns"/] --> NUMC["10 NUMERIC columns"]
+    X --> CATC["7 CATEGORICAL columns"]
+    NUMC --> NI["SimpleImputer median<br/>+ missing indicators"]
+    NI --> SS["StandardScaler"]
+    CATC --> CI["SimpleImputer<br/>constant missing"]
+    CI --> OH["OneHotEncoder<br/>min_frequency 20, infrequent group"]
+    SS --> CT["ColumnTransformer prep"]
+    OH --> CT
+    CT --> RG["Regressor from _regressor<br/>median, ridge, random_forest,<br/>gbm, mlp or lightgbm"]
+    RG --> P[/"Pipeline: prep + model"/]
+```
+
+The tuning, `models.tune`:
+
+```mermaid
+flowchart TD
+    IN[/"Training rows, target,<br/>courier_id groups"/] --> G{"Model is gbm?"}
+    G -- "no" --> ERR[/"ValueError"/]
+    G -- "yes" --> RS["RandomizedSearchCV<br/>n_iter settings from SEARCH_SPACE"]
+    RS --> CV["GroupKFold, 5 folds<br/>each courier in one validation fold"]
+    CV --> SC["Score: negative MAE"]
+    SC --> BEST["best_params_, best_score_"]
+    BEST --> RF["refit=True: fit the best setting<br/>on all training rows"]
+    RF --> OUT[/"best_estimator_ is the final model,<br/>cv table, cv_mae"/]
+```
+
 | Input | Output |
 |---|---|
 | The clean frame | A fitted pipeline, the tuning table |
@@ -299,6 +504,38 @@ flowchart TB
 
 **Purpose.** Tell how good the model is, for which deliveries, and give predictions for new deliveries.
 
+The evaluation, in `train.fit_and_score` and `train.save`:
+
+```mermaid
+flowchart LR
+    M[/"Fitted or tuned pipeline"/] --> PR["predict on the test rows"]
+    T[/"Test rows"/] --> PR
+    PR --> MET["metrics: MAE, RMSE, R²,<br/>MAPE, within 5 min"]
+    PR --> BS["bootstrap_mae<br/>1,000 draws, 95 %"]
+    PR --> SL["slice_metrics<br/>MAE and RMSE for each slice value"]
+    M --> IMP["importance: up to 3,000 rows,<br/>5 repeats, MAE increase"]
+    T --> IMP
+    MET --> CARD[("models/: metadata.json, slices.csv,<br/>importance.csv, model_card.md")]
+    BS --> CARD
+    SL --> CARD
+    IMP --> CARD
+```
+
+The prediction, `train.predict_file`:
+
+```mermaid
+flowchart TD
+    DIR[("models/<br/>metadata.json, model.joblib")] --> LM["load_model"]
+    LM --> FC{"Saved features =<br/>FEATURES of this version?"}
+    FC -- "no" --> ERR[/"ValueError: train it again"/]
+    FC -- "yes" --> LD["load the input file,<br/>require_target=False"]
+    IN[/"test.csv without a target"/] --> LD
+    LD --> MI["model_input"]
+    MI --> PR["model.predict"]
+    PR --> CL["Clip below 0 to 0,<br/>round to 4 decimals"]
+    CL --> OUT[/"submission.csv<br/>ID, Time_taken (min)"/]
+```
+
 | Input | Output |
 |---|---|
 | The fitted pipeline, the test rows, a file without a target | Metrics, slices, importance, `model_card.md`, `submission.csv` |
@@ -321,6 +558,28 @@ flowchart TB
 ---
 
 ## 8. Decision rules and thresholds
+
+The diagram shows the value rules that one row goes through before its values reach the pipeline.
+
+```mermaid
+flowchart TD
+    ROW[/"One raw row"/] --> CO{"Coordinate below 0?"}
+    CO -- "yes" --> AB["Use the absolute value,<br/>count a sign fix"]
+    CO -- "no" --> C1{"Absolute value<br/>below 1 degree?"}
+    AB --> C1
+    C1 -- "yes" --> CM["Coordinate missing"]
+    C1 -- "no" --> RT{"Rating outside 1 to 5?"}
+    CM --> RT
+    RT -- "yes" --> RM["Rating missing"]
+    RT -- "no" --> RO{"Pick-up earlier<br/>than the order?"}
+    RM --> RO
+    RO -- "yes" --> RD["Add 1 day to the pick-up"]
+    RO -- "no" --> PT{"prep_min below 0<br/>or above 120?"}
+    RD --> PT
+    PT -- "yes" --> PM["prep_min missing"]
+    PT -- "no" --> OUT[/"Values that reach the pipeline"/]
+    PM --> OUT
+```
 
 | Rule | Value | Code |
 |---|---|---|
@@ -406,6 +665,23 @@ pytest -q
 | `predict` | Scores a file without a target and writes the submission |
 | `demo` | Synthetic files, two comparisons, a tuned model, importance, slices and a submission |
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> SYN["eta-eats synth"]
+    KAG[/"Kaggle train.csv and test.csv"/] --> DATA
+    SYN --> DATA[("data/<br/>train.csv, test.csv")]
+    DATA --> CLN["eta-eats clean"]
+    DATA --> CMP["eta-eats compare"]
+    DATA --> TRN["eta-eats train"]
+    TRN --> MOD[("models/<br/>model.joblib, metadata.json")]
+    MOD --> PRD["eta-eats predict"]
+    DATA --> PRD
+    PRD --> SUB[/"reports/submission.csv"/]
+    INS --> DEMO["eta-eats demo<br/>synthetic data, compare, tuned gbm, submission"]
+```
+
 ### 10.4 Environment variables
 
 | Variable | Used by | Meaning |
@@ -415,7 +691,20 @@ pytest -q
 | `ETA_EATS_OUTPUT_DIR` | `predict` | Folder of `submission.csv`, default `reports` |
 | `ETA_EATS_SEED` | `train`, `compare` | Seed when `--seed` is not given, default `42` |
 
-eta-eats needs no credentials. Keep local settings in a `.env` file. Git ignores this file.
+eta-eats needs no credentials. It reads the variables from the process environment only. It does not load a `.env` file, so export local settings in the shell. Git ignores `.env`.
+
+```mermaid
+flowchart LR
+    ENV[/"Process environment"/] --> E1["ETA_EATS_DATA_DIR<br/>default data"]
+    ENV --> E2["ETA_EATS_MODEL_DIR<br/>default models"]
+    ENV --> E3["ETA_EATS_OUTPUT_DIR<br/>default reports"]
+    ENV --> E4["ETA_EATS_SEED<br/>default 42"]
+    E1 -- "no --data" --> C1["clean, train, compare<br/>read train.csv"]
+    E2 -- "no --out or --model-dir" --> C2["train writes,<br/>predict reads"]
+    E3 -- "no --out" --> C3["predict writes<br/>submission.csv"]
+    E4 -- "no --seed" --> C4["train, compare"]
+    E4 -- "not an integer" --> X[/"SystemExit with a message"/]
+```
 
 ---
 
